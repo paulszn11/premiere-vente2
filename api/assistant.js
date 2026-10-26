@@ -9,6 +9,7 @@
 //   ASSISTANT_ACCESS_CODE  conseillé : un code demandé une fois par la page ; sans lui, n'importe qui trouvant l'adresse peut utiliser ta clé.
 //                          Une personne connectée à son compte du site (Supabase) n'a pas besoin de ce code.
 //   ASSISTANT_MODEL        facultatif : modèle utilisé (par défaut gemini-3.8-flash avec Gemini, claude-haiku-5-5 avec Claude)
+//   ASSISTANT_FALLBACK_MODEL facultatif : second modèle Gemini gratuit si le premier est surchargé ou à court de quota (par défaut gemini-3.5-flash-lite)
 //   ALLOWED_ORIGIN         facultatif : l'adresse de ton site (https://…) pour refuser les appels venant d'ailleurs
 
 const RULES = "Tu es l'assistant de « Première vente », une formation en français qui guide un débutant, en 14 étapes et 87 missions, pour lancer une boutique Shopify en dropshipping depuis la France et vendre avec Google Ads (Shopping et Search). Tu réponds aux questions de l'apprenant.\n\nTes règles :\n1. Réponds en français, en tutoyant, avec des mots simples et des exemples concrets. Va droit au but : la réponse directe d'abord, puis le détail utile. Quand il s'agit d'étapes à suivre, fais une courte liste numérotée.\n2. Appuie-toi d'abord sur les extraits de la formation donnés avec la question (numérotés [1], [2]…). Quand une information vient d'un extrait, mets son numéro entre crochets à la fin de la phrase, par exemple [2]. Quand c'est utile, dis quelle mission ouvrir (« mission 2.2 »).\n3. N'invente jamais un chiffre, un tarif, une date, un seuil, un taux, le nom d'un bouton ou d'un menu, une adresse web ou une règle. Si l'information n'est pas dans les extraits, dis-le franchement ; tu peux donner une indication générale en précisant que ce n'est pas dans la formation, et conseiller de vérifier sur la page officielle (Google, Shopify, Urssaf, impots.gouv, Service Public). Les écrans et les règles changent : rappelle-le quand tu parles d'un écran, d'un tarif ou d'un seuil.\n4. Les chiffres de la « boutique fil rouge » sont un exemple fictif : présente-les comme un exemple, jamais comme les chiffres de l'apprenant. Si l'apprenant a saisi ses propres chiffres dans le calculateur, ils sont indiqués avec la question : utilise-les pour lui répondre.\n5. Droit, fiscalité, cotisations, statut : donne une information générale et renvoie vers un expert-comptable, l'Urssaf ou le service des impôts pour une décision qui le concerne personnellement.\n6. Si la question n'a pas de rapport avec la formation, l'e-commerce, Shopify ou Google Ads, réponds en une phrase et propose de revenir à la formation.\n7. Ne demande jamais de mot de passe, de code reçu par SMS ou de numéro de carte, et rappelle de ne jamais les partager.\n8. Pas de titre, pas de formule d'introduction (« Bonne question »), pas de phrase finale du type « N'hésite pas ». Termine, quand c'est utile, par la prochaine action concrète à faire dans la formation.";
@@ -124,32 +125,40 @@ export default {
   } };
 
 // ----- Gemini (offre gratuite de l'API Gemini, clé Google AI Studio) -----
-async function viaGemini(gkey, detail, history, final, think = true) {
-  const model = process.env.ASSISTANT_MODEL || 'gemini-3.8-flash';
+async function viaGemini(gkey, detail, history, final, think = true, alt = false) {
+  const main = process.env.ASSISTANT_MODEL || 'gemini-3.8-flash', spare = process.env.ASSISTANT_FALLBACK_MODEL || 'gemini-3.5-flash-lite';
+  const model = alt ? spare : main;
+  // jamais plus de 60 s (réponse rapide) ou 120 s (détaillée), et au plus 30 s sans rien recevoir
+  const ab = new AbortController(); const total = setTimeout(() => ab.abort(), detail ? 120000 : 60000);
   let up;
   try {
     up = await fetch(`${GEMINI}/v1beta/models/${encodeURIComponent(model)}:streamGenerateContent?alt=sse`, {
-      method: 'POST',
+      method: 'POST', signal: ab.signal,
       headers: { 'x-goog-api-key': gkey, 'content-type': 'application/json' },
       body: JSON.stringify({
         systemInstruction: { parts: [{ text: RULES }] },
         contents: history.concat([{ role: 'user', content: final }]).map(m => ({ role: m.role === 'assistant' ? 'model' : 'user', parts: [{ text: m.content }] })),
         generationConfig: Object.assign({ maxOutputTokens: detail ? 8000 : 4000, temperature: 0.3 }, think ? { thinkingConfig: { thinkingLevel: detail ? 'medium' : 'low' } } : {}) }) });
-  } catch (e) { return json({ error: 'upstream' }, 502); }
-  // si le modèle choisi n'accepte pas ce réglage de réflexion, on repart sans lui
-  if (think && up.status === 400) { try { console.error('API Gemini 400 avec réflexion réglée', (await up.text()).slice(0, 300)); } catch (e) {} return viaGemini(gkey, detail, history, final, false); }
+  } catch (e) { clearTimeout(total); return json({ error: 'upstream' }, 502); }
+  // si le modèle n'accepte pas ce réglage de réflexion, on repart sans lui
+  if (think && up.status === 400) { clearTimeout(total); try { console.error('API Gemini 400 avec réflexion réglée', model, (await up.text()).slice(0, 300)); } catch (e) {} return viaGemini(gkey, detail, history, final, false, alt); }
   if (!up.ok) {
+    clearTimeout(total);
     let t = ''; try { t = await up.text(); } catch (e) {}
-    console.error('API Gemini', up.status, t.slice(0, 500));
+    console.error('API Gemini', model, up.status, t.slice(0, 300));
+    // modèle surchargé ou quota gratuit épuisé : un second modèle gratuit prend le relais (il a son propre quota)
+    if ((up.status === 503 || up.status === 429 || up.status === 500) && !alt && spare && spare !== main) return viaGemini(gkey, detail, history, final, think, true);
     if (up.status === 429) return json({ error: /quota|per day|PerDay/i.test(t) ? 'quota' : 'rate_limited' }, 429);
     if (up.status === 503) return json({ error: 'rate_limited' }, 429);
     return json({ error: 'upstream' }, 502);
   }
   const enc = new TextEncoder(), dec = new TextDecoder();
   const reader = up.body.getReader();
+  let idle = 0;
   const stream = new ReadableStream({
     async start(ctl) {
       let buf = '', sent = false;
+      const bump = () => { clearTimeout(idle); idle = setTimeout(() => ab.abort(), 30000); };
       const handle = line => {
         if (!line.startsWith('data:')) return;
         let ev; try { ev = JSON.parse(line.slice(5).trim()); } catch (e) { return; }
@@ -162,17 +171,20 @@ async function viaGemini(gkey, detail, history, final, think = true) {
         else if (c.finishReason && !/^(STOP|FINISH_REASON_UNSPECIFIED|MAX_TOKENS)$/.test(c.finishReason) && !sent) ctl.enqueue(enc.encode('\u0000ERR:upstream'));
       };
       try {
+        bump();
         for (;;) {
           const { done, value } = await reader.read();
           if (done) break;
+          bump();
           buf += dec.decode(value, { stream: true });
           const lines = buf.split(/\r?\n/); buf = lines.pop();
           lines.forEach(handle);
         }
         if (buf) handle(buf);
-      } catch (e) { ctl.enqueue(enc.encode('\u0000ERR:upstream')); }
+      } catch (e) { ctl.enqueue(enc.encode('\u0000ERR:' + (ab.signal.aborted ? 'rate_limited' : 'upstream'))); }
+      clearTimeout(idle); clearTimeout(total);
       ctl.close();
     },
-    cancel() { try { reader.cancel(); } catch (e) {} } });
+    cancel() { clearTimeout(idle); clearTimeout(total); try { ab.abort(); } catch (e) {} try { reader.cancel(); } catch (e) {} } });
   return new Response(stream, { headers: { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store', 'x-content-type-options': 'nosniff' } });
 }
