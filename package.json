@@ -1,0 +1,8 @@
+{
+  "name": "premiere-vente",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  }
+}
