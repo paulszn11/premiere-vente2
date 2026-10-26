@@ -6,7 +6,8 @@
 // Variables d'environnement (une des deux clés suffit ; si les deux sont là, Gemini est utilisé) :
 //   GEMINI_API_KEY         clé gratuite créée dans Google AI Studio (offre gratuite de l'API Gemini)
 //   ANTHROPIC_API_KEY      clé payante créée dans la Claude Console
-//   ASSISTANT_ACCESS_CODE  conseillé : un code demandé une fois par la page ; sans lui, n'importe qui trouvant l'adresse peut utiliser ta clé
+//   ASSISTANT_ACCESS_CODE  conseillé : un code demandé une fois par la page ; sans lui, n'importe qui trouvant l'adresse peut utiliser ta clé.
+//                          Une personne connectée à son compte du site (Supabase) n'a pas besoin de ce code.
 //   ASSISTANT_MODEL        facultatif : modèle utilisé (par défaut gemini-3.8-flash avec Gemini, claude-haiku-5-5 avec Claude)
 //   ALLOWED_ORIGIN         facultatif : l'adresse de ton site (https://…) pour refuser les appels venant d'ailleurs
 
@@ -18,6 +19,13 @@ const hits = new Map(); // limite simple par adresse IP, le temps de vie de l'in
 const json = (o, status) => new Response(JSON.stringify(o), { status, headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' } });
 const str = (x, n) => String(x == null ? '' : x).slice(0, n);
 
+// Une personne connectée à son compte du site (Supabase) n'a pas besoin du code d'accès.
+async function signedIn(request) {
+  const url = (process.env.SUPABASE_URL || '').trim().replace(/\/+$/, ''), key = (process.env.SUPABASE_PUBLISHABLE_KEY || process.env.SUPABASE_ANON_KEY || '').trim();
+  const auth = request.headers.get('authorization') || '';
+  if (!url || !key || !/^Bearer\s+\S+$/.test(auth)) return false;
+  try { const r = await fetch(url + '/auth/v1/user', { headers: { apikey: key, authorization: auth } }); return r.ok; } catch (e) { return false; }
+}
 function tooMany(ip) {
   const now = Date.now(); const a = (hits.get(ip) || []).filter(t => now - t < 10 * 60 * 1000);
   a.push(now); hits.set(ip, a);
@@ -34,7 +42,7 @@ export default {
     const origin = process.env.ALLOWED_ORIGIN;
     if (origin && request.headers.get('origin') && request.headers.get('origin') !== origin) return json({ error: 'origin' }, 403);
     const code = process.env.ASSISTANT_ACCESS_CODE;
-    if (code && request.headers.get('x-access-code') !== code) return json({ error: 'access_code' }, 401);
+    if (code && request.headers.get('x-access-code') !== code && !(await signedIn(request))) return json({ error: 'access_code' }, 401);
     const ip = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim() || 'inconnu';
     if (tooMany(ip)) return json({ error: 'rate_limited' }, 429);
 

@@ -2324,7 +2324,9 @@ async function askViaClaude(t, ctx, onText, signal) {
 async function askViaApi(t, ctx, onText, signal) {
   const body = { question: t.q, mode: ASK.mode, context: askLearner(ctx), passages: t.refs.map(d => ({ n: d.n, titre: d.title + (d.mt ? ` (« ${d.mt} »)` : ''), texte: d.text })), history: askHistory(ASK.turns.indexOf(t)) };
   let r;
-  try { r = await fetch(HOSTED.assistant, { method: 'POST', headers: Object.assign({ 'content-type': 'application/json' }, ASK.code ? { 'x-access-code': ASK.code } : {}), body: JSON.stringify(body), signal }); }
+  let bearer = null;
+  try { if (typeof AUTH !== 'undefined' && AUTH.sb && AUTH.user) { const ss = (await AUTH.sb.auth.getSession()).data.session; if (ss) bearer = 'Bearer ' + ss.access_token; } } catch (e) {}
+  try { r = await fetch(HOSTED.assistant, { method: 'POST', headers: Object.assign({ 'content-type': 'application/json' }, ASK.code ? { 'x-access-code': ASK.code } : {}, bearer ? { authorization: bearer } : {}), body: JSON.stringify(body), signal }); }
   catch (e) { throw { code: signal.aborted ? 'cancelled' : 'upstream_error' }; }
   if (!r.ok) { let c = ''; try { c = (await r.json()).error || ''; } catch (e) {} throw { code: r.status === 401 ? 'access_code' : r.status === 429 ? (c === 'quota' ? 'quota' : 'rate_limited') : r.status === 503 ? 'not_configured' : c === 'refused' ? 'refused' : 'upstream_error' }; }
   let text = '', truncated = false;
