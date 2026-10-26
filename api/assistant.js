@@ -20,11 +20,19 @@ const json = (o, status) => new Response(JSON.stringify(o), { status, headers: {
 const str = (x, n) => String(x == null ? '' : x).slice(0, n);
 
 // Une personne connectée à son compte du site (Supabase) n'a pas besoin du code d'accès.
+// Un jeton vérifié est gardé 5 minutes en mémoire : les questions suivantes partent sans vérification.
+const okTokens = new Map();
 async function signedIn(request) {
   const url = (process.env.SUPABASE_URL || '').trim().replace(/\/+$/, ''), key = (process.env.SUPABASE_PUBLISHABLE_KEY || process.env.SUPABASE_ANON_KEY || '').trim();
   const auth = request.headers.get('authorization') || '';
   if (!url || !key || !/^Bearer\s+\S+$/.test(auth)) return false;
-  try { const r = await fetch(url + '/auth/v1/user', { headers: { apikey: key, authorization: auth } }); return r.ok; } catch (e) { return false; }
+  const now = Date.now(), hit = okTokens.get(auth);
+  if (hit && hit > now) return true;
+  try {
+    const r = await fetch(url + '/auth/v1/user', { headers: { apikey: key, authorization: auth } });
+    if (r.ok) { if (okTokens.size > 500) okTokens.clear(); okTokens.set(auth, now + 5 * 60 * 1000); }
+    return r.ok;
+  } catch (e) { return false; }
 }
 function tooMany(ip) {
   const now = Date.now(); const a = (hits.get(ip) || []).filter(t => now - t < 10 * 60 * 1000);
@@ -51,7 +59,7 @@ export default {
     const question = str(b && b.question, LIM.question).trim();
     if (!question) return json({ error: 'bad_request' }, 400);
     const detail = b.mode === 'detaille';
-    const passages = (Array.isArray(b.passages) ? b.passages : []).slice(0, LIM.passages)
+    const passages = (Array.isArray(b.passages) ? b.passages : []).slice(0, detail ? LIM.passages : 8)
       .map((p, i) => `[${Number(p && p.n) || i + 1}] ${str(p && p.titre, 200)}\n${str(p && p.texte, LIM.passage)}`).join('\n\n');
     const history = [];
     for (const t of (Array.isArray(b.history) ? b.history : []).slice(-LIM.history)) {
@@ -116,7 +124,7 @@ export default {
   } };
 
 // ----- Gemini (offre gratuite de l'API Gemini, clé Google AI Studio) -----
-async function viaGemini(gkey, detail, history, final) {
+async function viaGemini(gkey, detail, history, final, think = true) {
   const model = process.env.ASSISTANT_MODEL || 'gemini-3.8-flash';
   let up;
   try {
@@ -126,8 +134,10 @@ async function viaGemini(gkey, detail, history, final) {
       body: JSON.stringify({
         systemInstruction: { parts: [{ text: RULES }] },
         contents: history.concat([{ role: 'user', content: final }]).map(m => ({ role: m.role === 'assistant' ? 'model' : 'user', parts: [{ text: m.content }] })),
-        generationConfig: { maxOutputTokens: detail ? 8000 : 4000, temperature: 0.3 } }) });
+        generationConfig: Object.assign({ maxOutputTokens: detail ? 8000 : 4000, temperature: 0.3 }, think ? { thinkingConfig: { thinkingLevel: detail ? 'medium' : 'low' } } : {}) }) });
   } catch (e) { return json({ error: 'upstream' }, 502); }
+  // si le modèle choisi n'accepte pas ce réglage de réflexion, on repart sans lui
+  if (think && up.status === 400) { try { console.error('API Gemini 400 avec réflexion réglée', (await up.text()).slice(0, 300)); } catch (e) {} return viaGemini(gkey, detail, history, final, false); }
   if (!up.ok) {
     let t = ''; try { t = await up.text(); } catch (e) {}
     console.error('API Gemini', up.status, t.slice(0, 500));
