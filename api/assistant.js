@@ -74,7 +74,10 @@ export default {
     const final = `${str(b.context, LIM.context)}\n\nExtraits de la formation (sers-t'en en priorité et cite leur numéro entre crochets) :\n\n${passages || '(aucun extrait ne correspond)'}\n\n`
       + `${detail ? 'Réponse détaillée demandée : explique complètement, 400 mots au plus.' : 'Réponse courte demandée : 60 à 170 mots.'}\n\nQuestion de l'apprenant : ${question}`;
 
-    if (gkey) return viaGemini(gkey, detail, history, final);
+    // capture d'écran jointe (JPEG, PNG ou WebP, 4 Mo au plus)
+    const im = b.image && typeof b.image.data === 'string' && /^image\/(jpeg|png|webp)$/.test(String(b.image.type)) && b.image.data.length <= 5600000 && /^[A-Za-z0-9+/=]+$/.test(b.image.data.slice(0, 200)) ? { type: b.image.type, data: b.image.data } : null;
+    const finalTxt = im ? final + "\n\nL'apprenant a joint une capture d'écran : décris brièvement ce que tu y vois d'utile, puis réponds en t'appuyant sur la formation." : final;
+    if (gkey) return viaGemini(gkey, detail, history, finalTxt, true, false, im);
     let up;
     try {
       up = await fetch(API, {
@@ -85,7 +88,7 @@ export default {
           max_tokens: detail ? 6000 : 2500,
           output_config: { effort: detail ? 'high' : 'low' },
           system: RULES,
-          messages: history.concat([{ role: 'user', content: final }]),
+          messages: history.concat([{ role: 'user', content: im ? [{ type: 'image', source: { type: 'base64', media_type: im.type, data: im.data } }, { type: 'text', text: finalTxt }] : finalTxt }]),
           stream: true }) });
     } catch (e) { return json({ error: 'upstream' }, 502); }
     if (!up.ok) {
@@ -125,7 +128,7 @@ export default {
   } };
 
 // ----- Gemini (offre gratuite de l'API Gemini, clé Google AI Studio) -----
-async function viaGemini(gkey, detail, history, final, think = true, alt = false) {
+async function viaGemini(gkey, detail, history, final, think = true, alt = false, im = null) {
   const main = process.env.ASSISTANT_MODEL || 'gemini-3.8-flash', spare = process.env.ASSISTANT_FALLBACK_MODEL || 'gemini-3.5-flash-lite';
   const model = alt ? spare : main;
   // jamais plus de 60 s (réponse rapide) ou 120 s (détaillée), et au plus 30 s sans rien recevoir
@@ -137,17 +140,17 @@ async function viaGemini(gkey, detail, history, final, think = true, alt = false
       headers: { 'x-goog-api-key': gkey, 'content-type': 'application/json' },
       body: JSON.stringify({
         systemInstruction: { parts: [{ text: RULES }] },
-        contents: history.concat([{ role: 'user', content: final }]).map(m => ({ role: m.role === 'assistant' ? 'model' : 'user', parts: [{ text: m.content }] })),
+        contents: history.map(m => ({ role: m.role === 'assistant' ? 'model' : 'user', parts: [{ text: m.content }] })).concat([{ role: 'user', parts: (im ? [{ inlineData: { mimeType: im.type, data: im.data } }] : []).concat([{ text: final }]) }]),
         generationConfig: Object.assign({ maxOutputTokens: detail ? 8000 : 4000, temperature: 0.3 }, think ? { thinkingConfig: { thinkingLevel: detail ? 'medium' : 'low' } } : {}) }) });
   } catch (e) { clearTimeout(total); return json({ error: 'upstream' }, 502); }
   // si le modèle n'accepte pas ce réglage de réflexion, on repart sans lui
-  if (think && up.status === 400) { clearTimeout(total); try { console.error('API Gemini 400 avec réflexion réglée', model, (await up.text()).slice(0, 300)); } catch (e) {} return viaGemini(gkey, detail, history, final, false, alt); }
+  if (think && up.status === 400) { clearTimeout(total); try { console.error('API Gemini 400 avec réflexion réglée', model, (await up.text()).slice(0, 300)); } catch (e) {} return viaGemini(gkey, detail, history, final, false, alt, im); }
   if (!up.ok) {
     clearTimeout(total);
     let t = ''; try { t = await up.text(); } catch (e) {}
     console.error('API Gemini', model, up.status, t.slice(0, 300));
     // modèle surchargé ou quota gratuit épuisé : un second modèle gratuit prend le relais (il a son propre quota)
-    if ((up.status === 503 || up.status === 429 || up.status === 500) && !alt && spare && spare !== main) return viaGemini(gkey, detail, history, final, think, true);
+    if ((up.status === 503 || up.status === 429 || up.status === 500) && !alt && spare && spare !== main) return viaGemini(gkey, detail, history, final, think, true, im);
     if (up.status === 429) return json({ error: /quota|per day|PerDay/i.test(t) ? 'quota' : 'rate_limited' }, 429);
     if (up.status === 503) return json({ error: 'rate_limited' }, 429);
     return json({ error: 'upstream' }, 502);
